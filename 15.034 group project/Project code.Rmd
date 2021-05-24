@@ -1,0 +1,920 @@
+---
+title: "Project 2"
+author: "Team 8 - C/D"
+date: "4/26/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Data & Libraries
+```{r load, message: FALSE}
+library(quantmod)
+library(forecast)
+library(timeSeries)
+library(corrplot)
+
+rm(list = ls())
+data1 <- read.csv("BPPTrain.csv", header = TRUE)[,c(1,4)]
+data2 <- read.csv("BPPTrain.csv", header = TRUE)[,c(1,2,3)]
+
+colnames(data1)[1] <- "date"
+colnames(data2)[1] <- "date"
+
+data1[data1=="#N/A"] = NA #change #N/A to NA
+data1$NASDAQ = as.numeric(data1$NASDAQ) 
+data <- as.zoo(merge(as.timeSeries(data1), as.timeSeries(data2)))
+
+data = data[complete.cases(data),]
+```
+
+## Data Preparation
+```{r data prep}
+#calculate day-to-day difference
+dnas   <- diff(data$NASDAQ, na.pad = TRUE)
+dbpp   <- diff(data$BPP, na.pad = TRUE)
+dcpi   <- diff(data$CPI, na.pad = TRUE)
+#lag 1 row
+NASDAQ1     <- lag(data$NASDAQ, na.pad = TRUE, k=-1)
+dnas1       <- lag(dnas, na.pad = TRUE, k=-1)
+dbpp1       <- lag(dbpp, na.pad = TRUE, k=-1)
+dcpi1       <- lag(dcpi, na.pad = TRUE, k=-1)
+dnas2       <- lag(dnas, na.pad = TRUE, k =-2)
+dbpp2       <- lag(dbpp, na.pad = TRUE, k=-2)
+dcpi2       <- lag(dcpi, na.pad = TRUE, k=-2)
+nas_3d_mean <- lag(rollapply(data$NASDAQ, 3, mean,fill=NA,align = "right"),k=-1)
+nas_3d_max  <- lag(rollapply(data$NASDAQ, 3, max,fill=NA,align = "right"),k=-1)
+bpp_3d_median <- lag(rollapply(data$BPP, 3,median,fill=NA,align = "right"),k=-1)
+bpp_3d_max  <- lag(rollapply(data$BPP, 3,max,fill=NA,align = "right"),k=-1)
+nas_10d_mean <- lag(rollapply(data$NASDAQ, 10, mean,fill=NA,align = "right"),k=-1)
+nas_20d_mean <- lag(rollapply(data$NASDAQ, 20, mean,fill=NA,align = "right"),k=-1)
+
+cumavg.nas  <- lag(cumsum(c(data$NASDAQ))/seq(1:nrow(data)),na.pad=TRUE,k=-1)
+#calculate actual return y
+return      <- data$NASDAQ/NASDAQ1
+#add calculated fields back to data
+data       <- cbind(data, dnas, dbpp, dcpi, 
+                    dnas1, dbpp1, dcpi1, dnas2, dbpp2, dcpi2, 
+                    nas_3d_mean,nas_3d_max,bpp_3d_median,bpp_3d_max,nas_10d_mean,nas_20d_mean,
+                    cumavg.nas,return)
+```
+
+```{r}
+library(dplyr)
+
+#create time series split
+sequence <- seq(from=1, to=nrow(data))
+in.sample <- sequence<1500
+out.sample = nrow(data)-sum(in.sample)
+
+data.in  <- data[in.sample,] #training set
+data.val <- data[!in.sample,] #validation set
+
+#split validation to val & test
+sequence <- seq(from=1, to=out.sample)
+validation <- sequence<500
+data.val2  <- data.val[validation,] #training set
+data.test <- data.val[!validation,] #validation set
+
+```
+
+
+## Data Exploration/Visualization
+```{r}
+plot(data$NASDAQ)
+plot(dnas)
+plot(dbpp1,dnas)
+plot(dcpi1,dnas)
+plot(bpp_3d_median,dnas)
+```
+
+```{r}
+(cor(data.val, data.val$dnas))
+```
+
+## Investment Strategies
+
+### Strategy 1 - get best quantile
+
+We cross-validate on the validation set to find the best range to invest, the boundaries are calculated according to quantiles of the predicted values on validation set.
+
+```{r get_quantile function}
+get_quantile <- function(pred,val){
+  prob_range1 = seq(0, 0.5, by = 0.01)
+  prob_range2 = seq(1, 0.5, by = -0.01)
+  IR_best = 0
+  i_best = 0
+  j_best = 0
+  return_best = 0
+  for(i in prob_range1){
+    for (j in prob_range2){
+      buy.out   <- c(as.numeric(pred>=quantile(pred, probs = i)&
+                                pred<=quantile(pred, probs = j)))
+      dailyreturn.out  <- (val$return-1)*buy.out
+      #print(dailyreturn.out)
+      IR  <- mean(dailyreturn.out)/sd(dailyreturn.out)
+      #print(IR)
+      if(is.nan(IR)){
+        IR = 0
+        }
+      if(IR>IR_best){
+        IR_best = IR
+        i_best = quantile(pred, probs = i)
+        j_best = quantile(pred, probs = j)
+        return_best = dailyreturn.out
+      }
+    }
+  }
+  return(c(IR_best,i_best,j_best,return_best))
+}
+```
+
+### Strategy 2 - get best threshold
+
+This method is a correction of best_quantile method. The algorithm decides the best predicted `dnas` threshold for investment to be made based on validation set IR (pick the highest one). This method can be applied as a real trading strategy.
+
+```{r find best threshold}
+get_thres <- function(pred,val){
+  thres_range = seq(-20, 10, by = 0.1)
+  IR_best = 0
+  i_best = 0
+  return_best = 0
+  IR_range = replicate(length(thres_range),0)
+  for(j in 1:length(thres_range)){
+    i = thres_range[j]
+    buy.out   <- c(as.numeric(pred>=i))
+    dailyreturn.out  <- (val$return-1)*buy.out
+    IR  <- mean(dailyreturn.out)/sd(dailyreturn.out)
+    IR_range[j] = IR
+    if(IR>=IR_best & !is.na(IR)){
+      IR_best = IR
+      i_best = i
+      return_best = dailyreturn.out
+    }
+  }
+  plot(thres_range,IR_range,bg = 'gray',xlab="threshold",ylab="IR")
+  text(x=thres_range[IR_range==max(IR_range)], y=max(IR_range), labels="best threshold",col="red")
+  return(c(IR_best,i_best,return_best))
+}
+```
+
+### Strategy 3 - rolling average method
+
+This method calculates the rolling average of previous 5,10,20,30,50,100 days, and find the best n day that we should calculate for the predicted validation set. If the predicted `NASDAQ` value falls below the n-day mean minus 1 standard deviation, we buy, and if it falls above the n-day mean plus 1 standard deviation, we sell.
+
+```{r rolling_method}
+rolling_method <- function(pred,val){
+  n = 0
+  bestIR = 0
+  return = replicate(length(pred), 0)
+  n_range = c(5,10,20,30,50,100)
+  for (j in n_range){
+    alldata = rbind(data.in$return,pred)
+    rolling_mean <- rollapply(alldata, j, mean,fill=NA,align = "right")
+    rolling_mean <- rolling_mean[-(1:sum(in.sample))]
+    rolling_sd <- rollapply(alldata, j, sd,fill=NA,align = "right")
+    rolling_sd <- rolling_sd[-(1:sum(in.sample))]
+    buy.out <- replicate(length(pred), 0)
+    status = "out"
+    for (i in 1:length(pred)){
+      if(pred[i]<=rolling_mean[i]-rolling_sd[i]){
+        buy.out[i] = 1
+        status = "in"
+      }else if(pred[i]>=rolling_mean[i]+rolling_sd[i] & status == "in"){
+        buy.out[i] = 1
+        status = "out"
+      }else{
+        if(status == "in"){
+          buy.out[i]=1
+        }
+      }
+    }
+    dailyreturn.out  <- (val$return-1)*buy.out
+    IR  <- mean(dailyreturn.out)/sd(dailyreturn.out)
+    if(IR >bestIR){
+      bestIR = IR
+      n = j
+      return = dailyreturn.out
+    }
+  }
+  return(c(bestIR,n,return))
+}
+```
+
+### Preliminary evaluations
+
+All-in method:
+For simplicity, we assume every time we will invest all money into NASDAQ and sell all holdings at the end of the day.
+
+```{r}
+all_in<-function(return){
+  
+  cashovertime = 1:length(return)+1
+  cash.out = 10000000
+  cashovertime[1] = cash.out
+  #calculated compounded return
+  for(i in 1:length(return)){
+      cash.out <- cash.out*(as.numeric((return[i]+1)))
+      cashovertime[i+1] = cash.out
+  }
+  result = list()
+  result$cashreturn = (cash.out - 10000000)/10000000
+  result$overtime = cashovertime
+  return(result)
+}
+```
+
+
+Let's first see what the baseline is:
+
+```{r baseline}
+#calculate the baseline: holding NASDAQ all the time
+buy.out_baseline <- replicate(out.sample,1) #baseline (holding NASDAQ)
+dailyreturn.out_baseline  <- (data.val$return-1)*buy.out_baseline
+IR_baseline  <- mean(dailyreturn.out_baseline)/sd(dailyreturn.out_baseline)
+mean_return_baseline = mean(dailyreturn.out_baseline)
+cash_baseline = all_in(dailyreturn.out_baseline)
+cash_return_baseline = cash_baseline$cashreturn
+cash_overtime_baseline = cash_baseline$overtime
+data.frame(IR = IR_baseline,mean_return = mean_return_baseline,cash_return = cash_return_baseline)
+```
+
+use the simplest model to pick the best method
+```{r}
+#use data.val2, which is a subset of validation set, and test of data.test which is a hold-out
+lM1     <- lm(dnas ~ dnas1, data=data.in)
+pred.outl1   <- predict(lM1,  newdata=data.val2)
+
+lM1nasdaq     <- lm(NASDAQ ~ dnas1, data=data.in)
+pred.outl1nasdaq   <- predict(lM1nasdaq,  newdata=data.val2)
+
+l1_q  <- get_quantile(pred.outl1,data.val2)
+l1_lower = l1_q[2]
+l1_upper = l1_q[3]
+l1_t  <- get_thres(pred.outl1,data.val2)
+l1_thres = l1_t[2]
+l1_r  <- rolling_method(pred.outl1nasdaq,data.val2)
+
+pred.outl1_test   <- predict(lM1,  newdata=data.test)
+buy.out_q   <- c(as.numeric(pred.outl1_test>=l1_lower&
+                                pred.outl1_test<=l1_upper))
+dailyreturn.out_q  <- (data.test$return-1)*buy.out_q
+IR_q  <- mean(dailyreturn.out_q)/sd(dailyreturn.out_q)
+      
+buy.out_t   <- c(as.numeric(pred.outl1_test>=l1_thres))
+dailyreturn.out_t  <- (data.test$return-1)*buy.out_t
+IR_t  <- mean(dailyreturn.out_t)/sd(dailyreturn.out_t)
+
+data.frame(quantile_method=IR_q,
+           threshold_method = IR_t,
+           rolling_method = l1_r[1])
+```
+According to our preliminary comparison, we found out that using the best_quantile method works best. Our get_threshold methods also outputs a plot so we can seee how the IR changes with threshold.
+
+Let's compare it with the baseline on whole validation:
+```{r}
+pred.outl1   <- predict(lM1,  newdata=data.val)
+buy.out_q   <- c(as.numeric(pred.outl1>=l1_lower&
+                            pred.outl1<=l1_upper))
+dailyreturn.out_q  <- (data.val$return-1)*buy.out_q
+IR_q  <- mean(dailyreturn.out_q)/sd(dailyreturn.out_q)
+      
+buy.out_t   <- c(as.numeric(pred.outl1>=l1_thres))
+dailyreturn.out_t  <- (data.val$return-1)*buy.out_t
+IR_t  <- mean(dailyreturn.out_t)/sd(dailyreturn.out_t)
+l1_r  <- rolling_method(pred.outl1,data.val)
+
+data.frame(baseline = IR_baseline,
+          quantile_method=IR_q,
+           threshold_method = IR_t,
+           rolling_method = l1_r[1])
+```
+Quantile method is still the best,but we are going to test both quantile & threshold for future modeling.
+
+## Modeling
+
+### Linear Regressions
+```{r linear reg}
+#OLS
+lM1     <- lm(dnas ~ dnas1, data=data.in)
+lM2     <- lm(dnas ~ dnas1 + dbpp1 + dcpi1, data=data.in)
+lM3     <- lm(dnas ~ dnas1 + dbpp1 + dcpi1 + dbpp2 + dcpi2,data=data.in)
+lM4     <- lm(dnas ~ .-dnas-NASDAQ-return-dbpp-dcpi-CPI-BPP,data=data.in)
+lM5     <- lm(dnas ~ dnas1+bpp_3d_median,data=data.in)
+
+#predicted return = y_hat
+pred.outl1   <- predict(lM1,  newdata=data.val)
+pred.outl2   <- predict(lM2,  newdata=data.val)
+pred.outl3   <- predict(lM3, newdata=data.val)
+pred.outl4   <- predict(lM4, newdata=data.val)
+pred.outl5   <- predict(lM5, newdata=data.val)
+
+#apply investment strategy for each model
+lM1_q  <- get_quantile(pred.outl1,data.val)
+IR_lM1 = lM1_q[1]
+returnl1  <- lM1_q[-(1:3)]
+mean_return_lM1 = mean(returnl1)
+cash_lM1 = all_in(returnl1)
+cash_return_lM1 = cash_lM1$cashreturn
+cash_overtime_lM1 = cash_lM1$overtime
+
+lM1_t  <- get_thres(pred.outl1,data.val)
+IR_lM1_t = lM1_t[1]
+returnl1_t  <- lM1_t[-(1:2)]
+mean_return_lM1_t = mean(returnl1_t)
+cash_lM1_t = all_in(returnl1_t)
+cash_return_lM1_t = cash_lM1_t$cashreturn
+cash_overtime_lM1_t = cash_lM1_t$overtime
+
+lM2_q  <- get_quantile(pred.outl2,data.val)
+IR_lM2 = lM2_q[1]
+returnl2  <- lM2_q[-(1:3)]
+mean_return_lM2 = mean(returnl2)
+cash_lM2 = all_in(returnl2)
+cash_return_lM2 = cash_lM2$cashreturn
+cash_overtime_lM2 = cash_lM2$overtime
+
+lM2_t  <- get_thres(pred.outl2,data.val)
+IR_lM2_t = lM2_t[1]
+returnl2_t  <- lM2_t[-(1:2)]
+mean_return_lM2_t = mean(returnl2_t)
+cash_lM2_t = all_in(returnl2_t)
+cash_return_lM2_t = cash_lM2_t$cashreturn
+cash_overtime_lM2_t = cash_lM2_t$overtime
+
+lM3_q  <- get_quantile(pred.outl3,data.val)
+IR_lM3 = lM3_q[1]
+returnl3  <- lM3_q[-(1:3)]
+mean_return_lM3 = mean(returnl3)
+cash_lM3 = all_in(returnl3)
+cash_return_lM3 = cash_lM3$cashreturn
+cash_overtime_lM3 = cash_lM3$overtime
+
+lM3_t  <- get_thres(pred.outl3,data.val)
+IR_lM3_t = lM3_t[1]
+returnl3_t  <- lM3_t[-(1:2)]
+mean_return_lM3_t = mean(returnl3_t)
+cash_lM3_t = all_in(returnl3_t)
+cash_return_lM3_t = cash_lM3_t$cashreturn
+cash_overtime_lM3_t = cash_lM3_t$overtime
+
+
+lM4_q  <- get_quantile(pred.outl4,data.val)
+IR_lM4 = lM4_q[1]
+returnl4  <- lM4_q[-(1:3)]
+mean_return_lM4 = mean(returnl4)
+cash_lM4 = all_in(returnl4)
+cash_return_lM4 = cash_lM4$cashreturn
+cash_overtime_lM4 = cash_lM4$overtime
+
+
+lM4_t  <- get_thres(pred.outl4,data.val)
+IR_lM4_t = lM4_t[1]
+returnl4_t  <- lM4_t[-(1:2)]
+mean_return_lM4_t = mean(returnl4_t)
+cash_lM4_t = all_in(returnl4_t)
+cash_return_lM4_t = cash_lM4_t$cashreturn
+cash_overtime_lM4_t = cash_lM4_t$overtime
+
+
+lM5_q  <- get_quantile(pred.outl5,data.val)
+IR_lM5 = lM5_q[1]
+returnl5  <- lM5_q[-(1:3)]
+mean_return_lM5 = mean(returnl5)
+cash_lM5 = all_in(returnl5)
+cash_return_lM5 = cash_lM5$cashreturn
+cash_overtime_lM5 = cash_lM5$overtime
+
+
+lM5_t  <- get_thres(pred.outl5,data.val)
+IR_lM5_t = lM5_t[1]
+returnl5_t  <- lM5_t[-(1:2)]
+mean_return_lM5_t = mean(returnl5_t)
+cash_lM5_t = all_in(returnl5_t)
+cash_return_lM5_t = cash_lM5_t$cashreturn
+cash_overtime_lM5_t = cash_lM5_t$overtime
+
+
+output = data.frame(InformationRatio_q = c(IR_lM1,IR_lM2,IR_lM3,IR_lM4,IR_lM5),
+           MeanReturn_q = c(mean_return_lM1,mean_return_lM2,mean_return_lM3,
+                            mean_return_lM4,mean_return_lM5),
+           CashReturn_q = c(cash_return_lM1,cash_return_lM2,cash_return_lM3,
+                            cash_return_lM4,cash_return_lM5),
+           InformationRatio_t = c(IR_lM1_t,IR_lM2_t,IR_lM3_t,IR_lM4_t,IR_lM5_t),
+           MeanReturn_t = c(mean_return_lM1_t,mean_return_lM2_t,
+                            mean_return_lM3_t,mean_return_lM4_t,mean_return_lM5_t),
+           CashReturn_t = c(cash_return_lM1_t,cash_return_lM2_t,
+                            cash_return_lM3_t,cash_return_lM4_t,cash_return_lM5_t))
+row.names(output) <- c("lM1","lM2","lM3","lM4","lM5")
+output
+```
+The best-performing linear model(lM5) has dnas1+bpp_3d_median as the independent variable.
+
+```{r}
+plot(cash_overtime_lM5, type='l', col='green', xlab='Days',ylab='Cumulative Cash Value ($)')
+lines(cash_overtime_lM1,col='gray')
+lines(cash_overtime_lM2,col='gray')
+lines(cash_overtime_lM3,col='gray')
+lines(cash_overtime_lM4,col='gray')
+lines(cash_overtime_lM1_t,col='gray')
+lines(cash_overtime_lM2_t,col='gray')
+lines(cash_overtime_lM3_t,col='gray')
+lines(cash_overtime_lM4_t,col='gray')
+lines(cash_overtime_lM5_t,col='gray')
+lines(cash_overtime_baseline,col='black')
+lines(cash_overtime_lM5, col='green', lwd=2)
+title("Cumulative Cash Value over Time, OLS Models, out-of-sample")
+legend(1,1.4e7,legend=c("LM5 Quantile", "Baseline"), lty=1,col=c("green", "black"))
+```
+
+
+### Lasso
+
+```{r lasso,message = FALSE}
+set.seed(1)
+library(tidyverse)
+library(caret)
+library(glmnet)
+# Predictor variables
+excl = c('dnas','NASDAQ','CPI','BPP','return','dbpp','dcpi')
+x.train <- model.matrix(dnas~., data.in)
+x.train = x.train[,!(colnames(x.train) %in% excl)]
+x.val <- model.matrix(dnas~., data.val)
+x.val = x.val[,!(colnames(x.val) %in% excl)]
+# Outcome variable
+diff = nrow(data.in) - nrow(x.train)
+y.train <- data.in$dnas[-(1:diff)]
+cv <- cv.glmnet(x.train, y.train, alpha = 1)
+
+lasso <- glmnet(x.train, y.train, alpha = 1, lambda = cv$lambda.min)
+
+#predicted return = y_hat
+pred.outlasso <- predict(lasso,newx=x.val)
+
+lasso_q  <- get_quantile(pred.outlasso,data.val)
+IR_lasso = lasso_q[1]
+returnlasso <- lasso_q[-(1:3)]
+mean_return_lasso = mean(returnlasso)
+cash_lasso = all_in(returnlasso)
+cash_return_lasso = cash_lasso$cashreturn
+cash_overtime_lasso = cash_lasso$overtime
+
+lasso_t  <- get_thres(pred.outlasso,data.val)
+IR_lasso_t = lasso_t[1]
+returnlasso_t <- lasso_t[-(1:2)]
+mean_return_lasso_t = mean(returnlasso_t)
+cash_lasso_t = all_in(returnlasso_t)
+cash_return_lasso_t = cash_lasso_t$cashreturn
+cash_overtime_lasso_t = cash_lasso_t$overtime
+
+output = rbind(output,"lasso" = c(IR_lasso,mean_return_lasso,cash_return_lasso,
+                                  IR_lasso_t,mean_return_lasso_t,cash_return_lasso_t))
+output
+
+summary(pred.outlasso)
+```
+LASSO doesn't beat lM1 because it predicts every entry the same value. The major reason is that lasso pick non of the variables as significant and pushed them all to zero. The predicted value is the intercept. It's basically the baseline model. Lasso can give us meaningful results if we set the right random seed, but since we have to try hard to select a specific seed this means the method is not very robust and possibly would not generalize well.
+
+```{r}
+plot(cash_overtime_baseline, type='l', xlab="Days", ylab="Cumulative Cash Value ($)")
+lines(cash_overtime_lasso)
+lines(cash_overtime_lasso_t)
+title("Cash Value Over Time, Lasso Models (not different from baseline)")
+```
+
+
+### SVM
+
+```{r svm}
+#SVM
+library(e1071)
+svmM1 <- svm(dnas ~ dbpp2+dcpi1+nas_3d_mean, data=data.in)
+svmM2 <- svm(dnas ~ dnas1 + dbpp1 + dcpi1+ dbpp2 + dcpi2, data=data.in)
+svmM3 <- svm(dnas ~ .-NASDAQ-return-dbpp-dcpi-CPI-BPP, data=data.in) # all variables
+svmM4 <- svm(dnas ~ dnas1+dcpi1+dnas2+
+                    nas_3d_mean+nas_3d_max+bpp_3d_median+nas_10d_mean+
+                    cumavg.nas,data=data.in) # best for get_thres method
+svmM5 <- svm(dnas ~ dnas1+ dbpp1+ dcpi1+ dbpp2+dcpi2+ 
+                    nas_3d_mean+nas_3d_max+bpp_3d_median+bpp_3d_max+nas_10d_mean+
+                    cumavg.nas,data=data.in) # best for get_quantile method
+
+#predicted return = y_hat
+pred.outsvm1   <- predict(svmM1,  newdata=data.val)
+pred.outsvm2   <- predict(svmM2,  newdata=data.val)
+pred.outsvm3   <- predict(svmM3,  newdata=data.val)
+pred.outsvm4   <- predict(svmM4,  newdata=data.val)
+pred.outsvm5   <- predict(svmM5,  newdata=data.val)
+
+svm1_q  <- get_quantile(pred.outsvm1,data.val)
+IR_svm1 = svm1_q[1]
+returnsvm1 <- svm1_q[-(1:3)]
+mean_return_svm1 = mean(returnsvm1)
+cash_svm1 = all_in(returnsvm1)
+cash_return_svm1 = cash_svm1$cashreturn
+cash_overtime_svm1 = cash_svm1$overtime
+
+svm1_t  <- get_thres(pred.outsvm1,data.val)
+IR_svm1_t = svm1_t[1]
+returnsvm1_t <- svm1_t[-(1:3)]
+mean_return_svm1_t = mean(returnsvm1_t)
+cash_svm1_t = all_in(returnsvm1_t)
+cash_return_svm1_t = cash_svm1_t$cashreturn
+cash_overtime_svm1_t = cash_svm1_t$overtime
+
+
+svm2_q  <- get_quantile(pred.outsvm2,data.val)
+IR_svm2 = svm2_q[1]
+returnsvm2 <- svm2_q[-(1:3)]
+mean_return_svm2 = mean(returnsvm2)
+cash_svm2 = all_in(returnsvm2)
+cash_return_svm2 = cash_svm2$cashreturn
+cash_overtime_svm2 = cash_svm2$overtime
+
+svm2_t  <- get_thres(pred.outsvm2,data.val)
+IR_svm2_t = svm2_t[1]
+returnsvm2_t <- svm2_t[-(1:3)]
+mean_return_svm2_t = mean(returnsvm2_t)
+cash_svm2_t = all_in(returnsvm2_t)
+cash_return_svm2_t = cash_svm2_t$cashreturn
+cash_overtime_svm2_t = cash_svm2_t$overtime
+
+
+svm3_q  <- get_quantile(pred.outsvm3,data.val)
+IR_svm3 = svm3_q[1]
+returnsvm3 <- svm3_q[-(1:3)]
+mean_return_svm3 = mean(returnsvm3)
+cash_svm3 = all_in(returnsvm3)
+cash_return_svm3 = cash_svm3$cashreturn
+cash_overtime_svm3 = cash_svm3$overtime
+
+svm3_t  <- get_thres(pred.outsvm3,data.val)
+IR_svm3_t = svm3_t[1]
+returnsvm3_t <- svm3_t[-(1:3)]
+mean_return_svm3_t = mean(returnsvm3_t)
+cash_svm3_t = all_in(returnsvm3_t)
+cash_return_svm3_t = cash_svm3_t$cashreturn
+cash_overtime_svm3_t = cash_svm3_t$overtime
+
+svm4_q  <- get_quantile(pred.outsvm4,data.val)
+IR_svm4 = svm4_q[1]
+returnsvm4 <- svm4_q[-(1:3)]
+mean_return_svm4 = mean(returnsvm4)
+cash_svm4 = all_in(returnsvm4)
+cash_return_svm4 = cash_svm4$cashreturn
+cash_overtime_svm4 = cash_svm4$overtime
+
+
+svm4_t  <- get_thres(pred.outsvm4,data.val)
+IR_svm4_t = svm4_t[1]
+returnsvm4_t <- svm4_t[-(1:2)]
+mean_return_svm4_t = mean(returnsvm4_t)
+cash_svm4_t = all_in(returnsvm4_t)
+cash_return_svm4_t = cash_svm4_t$cashreturn
+cash_overtime_svm4_t = cash_svm4_t$overtime
+
+svm5_q  <- get_quantile(pred.outsvm5,data.val)
+IR_svm5 = svm5_q[1]
+returnsvm5 <- svm5_q[-(1:3)]
+mean_return_svm5 = mean(returnsvm5)
+cash_svm5 = all_in(returnsvm5)
+cash_return_svm5 = cash_svm5$cashreturn
+cash_overtime_svm5 = cash_svm5$overtime
+
+svm5_t  <- get_thres(pred.outsvm5,data.val)
+IR_svm5_t = svm5_t[1]
+returnsvm5_t <- svm5_t[-(1:3)]
+mean_return_svm5_t = mean(returnsvm5_t)
+cash_svm5_t = all_in(returnsvm5_t)
+cash_return_svm5_t = cash_svm5_t$cashreturn
+cash_overtime_svm5_t = cash_svm5_t$overtime
+
+output = rbind(output,"svm1" = c(IR_svm1,mean_return_svm1,cash_return_svm1,
+                                 IR_svm1_t,mean_return_svm1_t,cash_return_svm1_t),
+               "svm2" = c(IR_svm2,mean_return_svm2,cash_return_svm2,
+                          IR_svm2_t,mean_return_svm2_t,cash_return_svm2_t),
+               "svm3" = c(IR_svm3,mean_return_svm3,cash_return_svm3,
+                          IR_svm3_t,mean_return_svm3_t,cash_return_svm3_t),
+               "svm4" = c(IR_svm4,mean_return_svm4,cash_return_svm4,
+                          IR_svm4_t,mean_return_svm4_t,cash_return_svm4_t),
+               "svm5" = c(IR_svm5,mean_return_svm5,cash_return_svm5,
+                          IR_svm5_t,mean_return_svm5_t,cash_return_svm5_t))
+output
+
+```
+
+The best we can get from svm is svm4_t (SVM 4 with threshold investment strategy), formula =  (dnas1+dcpi1+dnas2+nas_3d_mean+nas_3d_max+bpp_3d_median+nas_10d_mean+cumavg.nas).
+
+```{r}
+plot(cash_overtime_svm4_t, type='l', col='green', xlab='Days',ylab='Cumulative Cash Value ($)')
+lines(cash_overtime_svm1,col='gray')
+lines(cash_overtime_svm2,col='gray')
+lines(cash_overtime_svm3,col='gray')
+lines(cash_overtime_svm4,col='lightgreen')
+lines(cash_overtime_svm5,col='gray')
+lines(cash_overtime_svm1_t,col='gray')
+lines(cash_overtime_svm2_t,col='gray')
+lines(cash_overtime_svm3_t,col='gray')
+lines(cash_overtime_svm5_t,col='gray')
+lines(cash_overtime_baseline,col='black')
+lines(cash_overtime_svm4_t, col='green', lwd=2)
+title("Cumulative Cash Value over Time, SVM Models, out-of-sample")
+legend(1,1.55e7,legend=c("SVM4 Threshold", "SVM4 Quantile" ,"Baseline"), lty=1,col=c("green","lightgreen", "black"))
+
+```
+
+
+### Random Forest
+
+```{r randomforest}
+library(randomForest)
+library(tidyr)
+
+data.in.nona =data.frame(data.in)%>%drop_na()
+excl = c('NASDAQ','BPP','CPI','return','dbpp','dcpi')
+x.rf.train = data.in.nona[,!(colnames(data.in.nona) %in% excl)]
+
+rf <- randomForest(dnas ~ .,data=x.rf.train,ntree = 200)
+
+pred.outrf = predict(rf, newdata=data.frame(data.val))
+
+rf_q  <- get_quantile(pred.outrf,data.val)
+IR_rf = rf_q[1]
+returnrf <- rf_q[-(1:3)]
+mean_return_rf = mean(returnrf)
+cash_rf = all_in(returnrf)
+cash_return_rf = cash_rf$cashreturn
+cash_overtime_rf = cash_rf$overtime
+
+rf_t  <- get_thres(pred.outrf,data.val)
+IR_rf_t = rf_t[1]
+returnrf_t <- rf_t[-(1:3)]
+mean_return_rf_t = mean(returnrf_t)
+cash_rf_t = all_in(returnrf_t)
+cash_return_rf_t = cash_rf_t$cashreturn
+cash_overtime_rf_t = cash_rf_t$overtime
+
+
+output = rbind(output,"Random Forest" = c(IR_rf,mean_return_rf,cash_return_rf,
+                                          IR_rf_t,mean_return_rf_t,cash_return_rf_t))
+output
+```
+Random Forest doesn't beat linear or svm.
+
+```{r}
+plot(cash_overtime_rf,type='l',col='green',xlab='Days',ylab='Cumulative Cash Value ($)')
+lines(cash_overtime_rf_t,col='gray')
+lines(cash_overtime_rf, col='green')
+lines(cash_overtime_baseline,col='black')
+title("Cumulative Cash Value over Time, RF Models, out-of-sample")
+legend(1,1.37e7,legend=c("RF Quantile" ,"RF Threshold","Baseline"), lty=1,col=c("green","gray", "black"))
+```
+
+### XGboost
+
+```{r xgboost}
+library(xgboost)
+set.seed(1)
+xg <- xgboost(data = x.train, label = as.integer(y.train>0), eta = 0.1,max.depth = 25,nrounds = 3, objective = "binary:logistic", verbose = 2)
+pred.xg <- predict(xg, x.val)
+
+xg_q  <- get_quantile(pred.xg,data.val)
+IR_xg = xg_q[1]
+returnxg <- xg_q[-(1:3)]
+mean_return_xg = mean(returnxg)
+cash_xg = all_in(returnxg)
+cash_return_xg = cash_xg$cashreturn
+cash_overtime_xg = cash_xg$overtime
+
+xg_t  <- get_thres(pred.xg,data.val)
+IR_xg_t = xg_t[1]
+returnxg_t <- xg_t[-(1:3)]
+mean_return_xg_t = mean(returnxg_t)
+cash_xg_t = all_in(returnxg_t)
+cash_return_xg_t = cash_xg_t$cashreturn
+cash_overtime_xg_t = cash_xg_t$overtime
+
+
+output = rbind(output,"XGboost" = c(IR_xg,mean_return_xg,cash_return_xg,
+                                    IR_xg_t,mean_return_xg_t,cash_return_xg_t))
+output
+```
+xgboost, doesn't beat lm or svm
+
+```{r}
+plot(cash_overtime_xg,type='l',col='green',xlab='Days',ylab='Cumulative Cash Value ($)')
+lines(cash_overtime_xg_t,col='gray')
+lines(cash_overtime_xg, col='green')
+lines(cash_overtime_baseline,col='black')
+title("Cumulative Cash Value over Time, XGBoost Models, out-of-sample")
+legend(1,1.34e7,legend=c("XGBoost Quantile" ,"XGBoost Threshold","Baseline"), lty=1,col=c("green","gray", "black"))
+```
+
+Let's look at each method:
+```{r}
+output[1:5,]
+```
+Among OLS, we pick lm5(Quantile Method) as our best performing model.
+
+```{r}
+output[7:11,]
+```
+Among SVM, we pick svm4(Threshold method) as our best performing model.
+
+Let's see final comparison
+```{r}
+final = data.frame(InformationRatio = c(IR_baseline,IR_lM5,IR_lasso,IR_svm4_t,IR_rf,IR_xg),
+           MeanReturn = c(mean_return_baseline,mean_return_lM5,mean_return_lasso,
+                          mean_return_svm4_t,mean_return_rf,mean_return_xg),
+           CashReturn = c(cash_return_baseline,cash_return_lM5,cash_return_lasso,
+                          cash_return_svm4_t,cash_return_rf,cash_return_xg))
+rownames(final) <-c("baseline","OLS5_quantile","lasso_quantile","SVM4_threshold","RandomForest_quantile","xgboost_quantile")
+final[order(-final$InformationRatio),]
+```
+
+
+```{r}
+plot(cash_overtime_svm4_t,type='l',col='green',xlab='Days',ylab='Cumulative Cash Value ($)')
+lines(cash_overtime_svm4_t,col='green')
+lines(cash_overtime_lM5, col='blue')
+lines(cash_overtime_xg, col='orange')
+lines(cash_overtime_rf, col='purple')
+lines(cash_overtime_lasso, col='gray')
+lines(cash_overtime_baseline, col='black')
+lines(cash_overtime_svm4_t,col='green')
+title("Cumulative Cash Value over Time, All Models, out-of-sample")
+legend(1,1.55e7,legend=c("SVM4 Threshold" ,"OLS5 Quantile","RF Quantile","XGBoost Quantile","Baseline"), lty=1,col=c("green","blue", "purple","orange","black"))
+```
+
+
+```{r}
+data.frame(Model = c("Best SVM","Lasso=Baseline","XGBoost","Best OLS","Random Forest"),
+           OutOfSampleRSquared = format(c( 
+1-(sum((data.val$dnas - pred.outsvm4)^2)/sum((data.val$dnas -mean(data.in$dnas[!is.na(data.in$dnas)]))^2)), 
+1-(sum((data.val$dnas - pred.outlasso)^2)/sum((data.val$dnas - mean(data.in$dnas[!is.na(data.in$dnas)]))^2)),
+1-(sum((data.val$dnas - pred.xg)^2)/sum((data.val$dnas - mean(data.in$dnas[!is.na(data.in$dnas)]))^2)),
+1-(sum((data.val$dnas - pred.outl5)^2)/sum((data.val$dnas - mean(data.in$dnas[!is.na(data.in$dnas)]))^2)),
+1-(sum((data.val$dnas - pred.outrf)^2)/sum((data.val$dnas - mean(data.in$dnas[!is.na(data.in$dnas)]))^2))
+),scientific=F)
+)
+```
+
+```{r}
+barplot(c(
+mean(sign(data.val$dnas) == sign(pred.outsvm4)),
+mean(sign(data.val$dnas) == sign(pred.xg)),
+mean(sign(data.val$dnas) == sign(pred.outlasso)),
+mean(sign(data.val$dnas) == sign(pred.outl5)),
+mean(sign(data.val$dnas) == sign(pred.outrf))), 
+names.arg=c("Best SVM", "XGBoost","Lasso=Baseline","Best OLS","Random Forest"),
+col=c("green","orange","gray","blue","purple"))
+title("Proportion of times dnas sign was correctly predicted")
+
+```
+
+
+## Summary
+the best performing models are SVM4_threshold and OLS5_quantile.
+```{r}
+svmM4 <- svm(dnas ~ dnas1+dcpi1+dnas2+
+                    nas_3d_mean+nas_3d_max+bpp_3d_median+nas_10d_mean+
+                    cumavg.nas,data=data.in) # best for get_thres method
+
+pred.outsvm4   <- predict(svmM4,  newdata=data.val)
+
+svm4_t  <- get_thres(pred.outsvm4,data.val)
+threshold_svm4 = svm4_t[2]
+
+
+print(paste("SVM model: we invest in all predicted value of dnas that's >=",threshold_svm4))
+```
+
+
+```{r}
+lM5     <- lm(dnas ~ dnas1+bpp_3d_median,data=data.in)
+pred.outl5   <- predict(lM5, newdata=data.val)
+lM5_q  <- get_quantile(pred.outl5,data.val)
+q1 = lM5_q[2]
+q2 = lM5_q[3]
+
+print(paste("OLS model: we invest in all predicted value of dnas that's >=",q1,"and <=",q2))
+```
+
+## Final in-sample metrics:
+
+
+```{r}
+insampledata = data[complete.cases(data),]
+
+lM5     <- lm(dnas ~ dnas1+bpp_3d_median,data=insampledata)
+pred.wholesample  <- predict(lM5, newdata=insampledata)
+
+#lM5_q  <- get_quantile(pred.wholesample,insampledata)
+
+buy   <- c(as.numeric((pred.wholesample>=2.66644464508991)&
+                                (pred.wholesample<=3.90782832612255)))
+
+dailyreturn  <- (insampledata$return-1)*buy
+
+IRlm5  <- mean(dailyreturn)/sd(dailyreturn)
+print(IRlm5)
+      
+mean_return_lM5 = mean(dailyreturn)
+print(mean_return_lM5)
+
+cash_lm5 = all_in(dailyreturn)
+cash_return_lm5 = cash_lm5$cashreturn
+cash_overtime_lm5 = cash_lm5$overtime
+print(cash_return_lm5)
+
+```
+
+
+```{r}
+svmM4 <- svm(dnas ~ dnas1+dcpi1+dnas2+
+                    nas_3d_mean+nas_3d_max+bpp_3d_median+nas_10d_mean+
+                    cumavg.nas,data=insampledata)
+
+pred.wholesample   <- predict(svmM4,  newdata=insampledata)
+
+buy   <- c(as.numeric(pred.wholesample>=6.5))
+
+dailyreturn  <- (insampledata$return-1)*buy
+
+IRsvm  <- mean(dailyreturn)/sd(dailyreturn)
+print(IRsvm)
+      
+mean_return_svm4 = mean(dailyreturn)
+print(mean_return_svm4)
+
+cash_SVM4 = all_in(dailyreturn)
+cash_return_SVM4 = cash_SVM4$cashreturn
+cash_overtime_SVM4 = cash_SVM4$overtime
+print(cash_return_SVM4)
+```
+
+```{r}
+buy_baseline   <- 1
+
+dailyreturn  <- (insampledata$return-1)*buy_baseline
+
+IRbaseline  <- mean(dailyreturn)/sd(dailyreturn)
+print(IRbaseline)
+      
+mean_baseline = mean(dailyreturn)
+print(mean_baseline)
+
+cash_bline = all_in(dailyreturn)
+cash_return_bline = cash_bline$cashreturn
+cash_overtime_bline = cash_bline$overtime
+print(cash_return_bline)
+```
+
+```{r}
+data.frame(Model=c("SVM4Threshold","OLS5Quantile","Baseline"), 
+           InformationRatio=c(IRsvm,IRlm5,IRbaseline),
+           MeanReturn=c(mean_return_svm4,mean_return_lM5,mean_baseline),
+           CashReturn = c(cash_return_SVM4,cash_return_lm5,cash_return_bline))
+```
+
+
+
+```{r}
+plot(cash_overtime_SVM4,type='l',col='green',xlab='Days',ylab='Cumulative Cash Value ($)')
+lines((cash_overtime_lm5),col='blue')
+lines((cash_overtime_bline),col='black')
+title("Cumulative Cash Value over Time, Best Models, in-sample")
+legend(1,4.5e7,legend=c("SVM4 Threshold" ,"OLS5 Quantile","Baseline"), lty=1,col=c("green","blue","black"))
+```
+
+
+### Extra: try short selling, does not work better
+```{r}
+svmM4 <- svm(dnas ~ dnas1+dcpi1+dnas2+
+                    nas_3d_mean+nas_3d_max+bpp_3d_median+nas_10d_mean+
+                    cumavg.nas,data=data.in)
+
+pred.wholesample   <- predict(svmM4,  newdata=insampledata)
+
+buy   <- (as.numeric(pred.wholesample>=6.5))
+
+buy[pred.wholesample<-6.5]   <- -1
+
+dailyreturn  <- (insampledata$return-1)*buy
+
+IR  <- mean(dailyreturn)/sd(dailyreturn)
+print(IR)
+      
+mean_return_svm4 = mean(dailyreturn)
+print(mean_return_svm4)
+
+cash_return_svm4 = all_in(dailyreturn)$cashreturn
+print(cash_return_svm4)
+```
+
+
+
+
+
+

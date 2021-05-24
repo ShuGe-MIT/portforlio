@@ -1,0 +1,56 @@
+﻿cal_lambda.m takes alpha and prices as input and produce the lambdas as defined in the model solution.
+ 
+calculate_std.m calculates the standard deviation of a probability distribution. The input sup is the support of the distribution, the input prob is the probability of each point, n is the number of discretized grids.
+
+compute_error.m computes the Wald metric given a guess of structural parameters. The input para is the guess, the input data is the data (including the prices, shocks, etc.), the input BETA_data, W_data are computed from the data (these are, respectively, structural coefficients and covariance matrix computed from the true data adding the error term (equivalent to the data we collect)).
+
+construct_S.m constructs the matrix from which we generate the error terms. The values are from Table 1 of the draft paper.
+
+ini_normal.m discretize and initialize a normal distribution given the mean and standard deviation. The lower and upper bounds are respectively mean±3*std.
+
+parameter.m contains all the parameter values.
+
+price.m creates the distribution of the prices of all the input factors. The mean values are from Table 3 of the draft paper. The std values are chosen such that the generated discretized distribution has the same standard deviation as the values in Table 3.
+
+random_num.m creates an x*y matrix of random numbers with lower and upper bounds specified.
+
+shock.m creates the distribution of all the shocks, with mean and standard deviation from Table 3.
+
+solve_x.m solves the model with given structural parameter values. solve_x1.m, solve_x2.m, solve_x3.m solve the input and output of each stage. solve_x.m calls solve_x1.m, solve_x2.m, and solve_x3.m in turn. 
+
+SUR.m does the seemingly unrelated regression without clustering or heterogeneity. The formula could be found at 
+SUR_robust_cluster_vce_2020_05_25.pdf, section 2.
+SUR_matrix.m has the same function as SUR.m but do computations in matrix computation following SUR_robust_cluster_vce_2020_05_25.pdf.
+
+SUR_real.m does the SUR with clustering. The formula follows SUR_robust_cluster_vce_2020_05_25.pdf, section 3.1. 
+SUR_real_matrix.m has the same function as SUR_real.m but do computations in matrix computation following SUR_robust_cluster_vce_2020_05_25.pdf.
+
+SUR_synthetic.m does SUR with robust covariance, but without clustering, following the same pdf, section 3.2.
+SUR_synthetic_matrix.m has the same function as SUR_synthetic.m but do computations in matrix computation following SUR_robust_cluster_vce_2020_05_25.pdf.
+
+Note: SUR non-matrix .m files use optimal (in terms of fastest run time) combination of matrix and summation notation
+
+form_ini_guess_full.m formulates the initial guess. For gamma and theta, we use grid search. The function also parse out the initial guesses that yield imaginary number input output values.
+
+polish_initial_guess.m polishes the initial guess from form_ini_guess_full.m. The function improves the initial guess through trying different gamma and theta value.
+
+summary.m generates the summary tables.
+
+main_file.m acts as the main function. The logic flow goes as the following:
+1. get structural parameter values from parameter.m.
+2. draw initial distribution of prices, shocks, and initial conditions.
+3. solve the model with the initial distribution and the paramter values.
+4. generate the error term sai.
+5. generate initial guesses for alpha and initial condition
+6. use fmincon to match
+For details on point 5, see file 'preliminaries of matching.docx'
+
+independent_weather_pattern_search.m is the same as independent_weather.m except that it uses pattern search instead of fmincon in searching for the structural parameters.
+
+eps_data.mat contains realized shocks.
+guess_polished.mat contains the polished initial guesses.
+price_data.mat contains realized prices.
+result_with_regression_little_sai.mat contains the structural model solution with the true parameter value.
+structural parameter.mat contains the true structural parameter values.
+y0.mat contains realized initial conditions.
+
